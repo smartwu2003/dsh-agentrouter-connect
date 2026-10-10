@@ -22,6 +22,7 @@ import type {
   ResolvedRetryPolicy,
   StreamChunk,
   ToolCallId,
+  ReplayEnvelope,
 } from '@deepseek-ai/dsh-llm';
 import { request as undiciRequest } from 'undici';
 import {
@@ -186,7 +187,7 @@ export interface AgentRouterAdapterOptions {
  */
 type OpenBlock =
   | { kind: 'text'; acc: string }
-  | { kind: 'reasoning'; acc: string }
+  | { kind: 'reasoning'; acc: string; signature?: string }
   | { kind: 'tool-call'; id: string; name: string; acc: string };
 
 export class AgentRouterLlmAdapter extends LlmAdapter {
@@ -207,7 +208,9 @@ export class AgentRouterLlmAdapter extends LlmAdapter {
   }
 
   providerRetryPolicy(_provider: string): ResolvedRetryPolicy {
-    return resolveRetryPolicy(undefined, 'dsh-agentrouter-connect retryPolicy');
+    // 适配器内部已通过 silentRetry 控制渠道方言与 5xx 重试，
+    // 此处设为 maxRetries: 0，避免外层 harness 产生指数级重试乘数。
+    return resolveRetryPolicy({ mode: 'normal', maxRetries: 0 }, 'dsh-agentrouter-connect retryPolicy');
   }
 
   async listModels(_provider: string): Promise<LlmModelInfo[]> {
@@ -306,7 +309,8 @@ export class AgentRouterLlmAdapter extends LlmAdapter {
 
     for (let attempt = 1; attempt <= maxAttempts; attempt++) {
       if (options.signal?.aborted) {
-        throw new LlmError('Request aborted by caller', 'ABORTED');
+        yield { type: 'finish', reason: { kind: 'aborted', failure: { code: 'ABORTED', message: 'Request aborted' } } };
+        return;
       }
 
       try {
@@ -319,7 +323,8 @@ export class AgentRouterLlmAdapter extends LlmAdapter {
         });
       } catch (err: any) {
         if (options.signal?.aborted) {
-          throw new LlmError('Request aborted by caller', 'ABORTED', { cause: err });
+          yield { type: 'finish', reason: { kind: 'aborted', failure: { code: 'ABORTED', message: 'Request aborted' } } };
+          return;
         }
         if (attempt < maxAttempts) {
           this.logger?.warn?.(`AgentRouter 网络请求异常，第 ${attempt + 1}/${maxAttempts} 次重发:`, err?.message || String(err));
@@ -372,10 +377,18 @@ export class AgentRouterLlmAdapter extends LlmAdapter {
       );
     }
 
-    if (protocol === 'anthropic') {
-      yield* this.streamAnthropic(upstreamRes.body, options.signal);
-    } else {
-      yield* this.streamOpenAi(upstreamRes.body, options.signal);
+    try {
+      if (protocol === 'anthropic') {
+        yield* this.streamAnthropic(upstreamRes.body, options.signal);
+      } else {
+        yield* this.streamOpenAi(upstreamRes.body, options.signal);
+      }
+    } finally {
+      try {
+        upstreamRes.body.destroy();
+      } catch {
+        // 忽略关闭异常
+      }
     }
   }
 
@@ -496,7 +509,17 @@ export class AgentRouterLlmAdapter extends LlmAdapter {
         const toolCalls = extractToolCalls(msg);
         const blocks: any[] = [];
         if (reasoning) {
-          blocks.push({ type: 'thinking', thinking: reasoning, signature: 'signature' });
+          // 查找该 assistant 消息的历史 replayState 里记录的真实签名
+          const replayBlocks = (msg as any).source?.replayState?.blocks as Array<any> | undefined;
+          const matchedBlock = replayBlocks?.find((b: any) => b?.type === 'thinking' && b.signature);
+          const signature = matchedBlock?.signature || (msg as any).thinkingSignature;
+          if (signature && typeof signature === 'string' && signature.trim()) {
+            blocks.push({ type: 'thinking', thinking: reasoning, signature: signature.trim() });
+          } else {
+            // 无真实签名（如跨模型会话、未捕获签名的历史回合），按 Anthropic 规范降级为 text 块，
+            // 绝不注入 'signature' 假字面量，避免上游 400 校验拒绝
+            blocks.push({ type: 'text', text: reasoning });
+          }
         }
         if (text) {
           blocks.push({ type: 'text', text });
@@ -556,7 +579,25 @@ export class AgentRouterLlmAdapter extends LlmAdapter {
     if (info.reasoning?.supports) {
       const effort = options.reasoningEffort ?? 'medium';
       if (effort !== 'off' && effort !== 'none') {
-        payload.thinking = { type: 'enabled', budget_tokens: 1024 };
+        const maxTokens = typeof payload.max_tokens === 'number' ? payload.max_tokens : (info.maxTokens ?? 4096);
+        let budget = 1024;
+        if (effort === 'low') {
+          budget = Math.max(1024, Math.min(2048, Math.floor(maxTokens * 0.25)));
+        } else if (effort === 'high') {
+          budget = Math.max(1024, Math.min(32768, Math.floor(maxTokens * 0.75)));
+        } else {
+          budget = Math.max(1024, Math.min(8192, Math.floor(maxTokens * 0.5)));
+        }
+        // Anthropic 约束：budget_tokens 必须严格小于 max_tokens
+        if (budget >= maxTokens) {
+          budget = Math.max(1024, maxTokens - 256);
+        }
+        if (maxTokens <= budget) {
+          payload.max_tokens = budget + 1024;
+        }
+        if (budget >= 1024) {
+          payload.thinking = { type: 'enabled', budget_tokens: budget };
+        }
       }
     }
 
@@ -596,233 +637,336 @@ export class AgentRouterLlmAdapter extends LlmAdapter {
     body: import('undici').Dispatcher.ResponseData['body'],
     signal?: AbortSignal,
   ): AsyncIterable<StreamChunk> {
+    const onAbort = () => {
+      try {
+        body.destroy();
+      } catch {}
+    };
+    if (signal) {
+      if (signal.aborted) {
+        onAbort();
+        yield { type: 'finish', reason: { kind: 'aborted', failure: { code: 'ABORTED', message: 'Request aborted' } } };
+        return;
+      }
+      signal.addEventListener('abort', onAbort, { once: true });
+    }
+
     let buffer = '';
     let nextBlockIdx = 0;
     let finishEmitted = false;
     let textIdx: number | undefined;
     let reasoningIdx: number | undefined;
     const open = new Map<number, OpenBlock>();
+    const allBlocks: OpenBlock[] = [];
     // tool_calls[] 用自己的 index 编号，需要映射到内容块序号。
     const toolBlockOf = new Map<number, number>();
 
-    for await (const chunk of body) {
-      if (signal?.aborted) {
-        yield* this.closeBlocks(open);
-        yield { type: 'finish', reason: { kind: 'aborted', failure: { code: 'ABORTED', message: 'Request aborted' } } };
-        return;
-      }
+    const buildReplayState = (finishReason: string): ReplayEnvelope => ({
+      response: { finish_reason: finishReason },
+      blocks: allBlocks.map((b) => {
+        if (b.kind === 'reasoning') return { type: 'reasoning', reasoning_content: b.acc };
+        if (b.kind === 'tool-call') return { type: 'tool-call', id: b.id, name: b.name };
+        return { type: 'text' };
+      }),
+    });
 
-      buffer += (chunk as Buffer).toString('utf8');
-      const lines = buffer.split('\n');
-      buffer = lines.pop() ?? '';
-
-      for (const rawLine of lines) {
-        const line = rawLine.trim();
-        if (!line.startsWith('data: ')) continue;
-        const dataStr = line.slice(6).trim();
-        if (dataStr === '[DONE]') {
+    try {
+      for await (const chunk of body) {
+        if (signal?.aborted) {
           yield* this.closeBlocks(open);
-          // 有的兼容实现只发 [DONE] 不给 finish_reason；补一个终止事件，
-          // 否则 harness 会把这次流转当成被截断。
-          if (!finishEmitted) yield { type: 'finish', reason: { kind: 'stop' } };
+          yield { type: 'finish', reason: { kind: 'aborted', failure: { code: 'ABORTED', message: 'Request aborted' } } };
           return;
         }
 
-        try {
-          const json = JSON.parse(dataStr);
-          const choice = json.choices?.[0];
-          const delta = choice?.delta;
+        buffer += (chunk as Buffer).toString('utf8');
+        const lines = buffer.split('\n');
+        buffer = lines.pop() ?? '';
 
-          // 1. 思考 / 推理增量
-          const reasoningContent = delta?.reasoning_content ?? delta?.reasoning;
-          if (typeof reasoningContent === 'string' && reasoningContent.length > 0) {
-            if (reasoningIdx === undefined) {
-              reasoningIdx = nextBlockIdx++;
-              open.set(reasoningIdx, { kind: 'reasoning', acc: '' });
-              yield { type: 'block-start', index: reasoningIdx, blockType: 'reasoning' };
-            }
-            const rb = open.get(reasoningIdx) as { kind: 'reasoning'; acc: string };
-            rb.acc += reasoningContent;
-            yield { type: 'reasoning-delta', index: reasoningIdx, text: reasoningContent };
-          }
-
-          // 2. 正文文本增量
-          if (typeof delta?.content === 'string' && delta.content.length > 0) {
-            if (textIdx === undefined) {
-              textIdx = nextBlockIdx++;
-              open.set(textIdx, { kind: 'text', acc: '' });
-              yield { type: 'block-start', index: textIdx, blockType: 'text' };
-            }
-            const tb2 = open.get(textIdx) as { kind: 'text'; acc: string };
-            tb2.acc += delta.content;
-            yield { type: 'text-delta', index: textIdx, text: delta.content };
-          }
-
-          // 3. 工具调用增量
-          if (Array.isArray(delta?.tool_calls)) {
-            for (const tc of delta.tool_calls) {
-              const tcIndex = tc.index ?? 0;
-              let bIdx = toolBlockOf.get(tcIndex);
-              if (bIdx === undefined) {
-                bIdx = nextBlockIdx++;
-                toolBlockOf.set(tcIndex, bIdx);
-                open.set(bIdx, { kind: 'tool-call', id: '', name: '', acc: '' });
-                yield { type: 'block-start', index: bIdx, blockType: 'tool-call' };
-              }
-              const tb = open.get(bIdx) as { kind: 'tool-call'; id: string; name: string; acc: string };
-              if (tc.id) tb.id = tc.id;
-              if (tc.function?.name) tb.name = tc.function.name;
-              const argsDelta: string = tc.function?.arguments ?? '';
-              tb.acc += argsDelta;
-              yield {
-                type: 'tool-call-delta',
-                index: bIdx,
-                id: (tb.id || 'call_' + tcIndex) as ToolCallId,
-                ...(tb.name ? { name: tb.name } : {}),
-                argumentsDelta: argsDelta,
-              };
-            }
-          }
-
-          // 4. Token 使用量
-          if (json.usage) {
-            yield {
-              type: 'usage',
-              usage: {
-                inputTokens: json.usage.prompt_tokens ?? 0,
-                outputTokens: json.usage.completion_tokens ?? 0,
-                totalTokens: json.usage.total_tokens ?? 0,
-              },
-            };
-          }
-
-          // 5. 结束原因：OpenAI 流里唯一可靠的「块结束」信号。
-          if (choice?.finish_reason && !finishEmitted) {
-            finishEmitted = true;
-            yield* this.closeBlocks(open);
-            const fr = choice.finish_reason;
-            yield {
-              type: 'finish',
-              reason: fr === 'tool_calls' ? { kind: 'tool-calls' }
-                : fr === 'length' ? { kind: 'max-tokens' }
-                : { kind: 'stop' },
-            };
-          }
-        } catch {
-          // 忽略单行解析失败
-        }
-      }
-    }
-
-    // 流在没有终止事件的情况下结束：仍然把已打开的块收口。
-    yield* this.closeBlocks(open);
-    if (!finishEmitted) yield { type: 'finish', reason: { kind: 'stop' } };
-  }
-
-  private async *streamAnthropic(
-    body: import('undici').Dispatcher.ResponseData['body'],
-    signal?: AbortSignal,
-  ): AsyncIterable<StreamChunk> {
-    let buffer = '';
-    let currentEvent = '';
-    let nextBlockIdx = 0;
-    let finishEmitted = false;
-    const open = new Map<number, OpenBlock>();
-
-    for await (const chunk of body) {
-      if (signal?.aborted) {
-        yield* this.closeBlocks(open);
-        yield { type: 'finish', reason: { kind: 'aborted', failure: { code: 'ABORTED', message: 'Request aborted' } } };
-        return;
-      }
-
-      buffer += (chunk as Buffer).toString('utf8');
-      const lines = buffer.split('\n');
-      buffer = lines.pop() ?? '';
-
-      for (const rawLine of lines) {
-        const line = rawLine.trim();
-        if (line.startsWith('event: ')) {
-          currentEvent = line.slice(7).trim();
-        } else if (line.startsWith('data: ')) {
+        for (const rawLine of lines) {
+          const line = rawLine.trim();
+          if (!line.startsWith('data: ')) continue;
           const dataStr = line.slice(6).trim();
+          if (dataStr === '[DONE]') {
+            yield* this.closeBlocks(open);
+            // 有的兼容实现只发 [DONE] 不给 finish_reason；补一个终止事件，
+            // 否则 harness 会把这次流转当成被截断。
+            if (!finishEmitted) {
+              finishEmitted = true;
+              yield { type: 'finish', reason: { kind: 'stop' }, replayState: buildReplayState('stop') };
+            }
+            return;
+          }
+
           try {
             const json = JSON.parse(dataStr);
+            const choice = json.choices?.[0];
+            const delta = choice?.delta;
 
-            if (currentEvent === 'content_block_start') {
-              const b = json.content_block;
-              const index = json.index ?? nextBlockIdx;
-              if (b?.type === 'text') {
-                open.set(index, { kind: 'text', acc: '' });
-                yield { type: 'block-start', index, blockType: 'text' };
-              } else if (b?.type === 'thinking') {
-                open.set(index, { kind: 'reasoning', acc: '' });
-                yield { type: 'block-start', index, blockType: 'reasoning' };
-              } else if (b?.type === 'tool_use') {
-                open.set(index, { kind: 'tool-call', id: b.id ?? '', name: b.name ?? '', acc: '' });
-                yield { type: 'block-start', index, blockType: 'tool-call' };
+            // 1. 思考 / 推理增量
+            const reasoningContent = delta?.reasoning_content ?? delta?.reasoning;
+            if (typeof reasoningContent === 'string' && reasoningContent.length > 0) {
+              if (reasoningIdx === undefined) {
+                reasoningIdx = nextBlockIdx++;
+                const rb: OpenBlock = { kind: 'reasoning', acc: '' };
+                open.set(reasoningIdx, rb);
+                allBlocks.push(rb);
+                yield { type: 'block-start', index: reasoningIdx, blockType: 'reasoning' };
               }
-              nextBlockIdx = Math.max(nextBlockIdx, index + 1);
-            } else if (currentEvent === 'content_block_delta') {
-              const d = json.delta;
-              const index = json.index ?? 0;
-              const block = open.get(index);
-              if (d?.type === 'text_delta') {
-                if (block?.kind === 'text') block.acc += d.text ?? '';
-                yield { type: 'text-delta', index, text: d.text ?? '' };
-              } else if (d?.type === 'thinking_delta') {
-                if (block?.kind === 'reasoning') block.acc += d.thinking ?? '';
-                yield { type: 'reasoning-delta', index, text: d.thinking ?? '' };
-              } else if (d?.type === 'input_json_delta') {
-                const argsDelta: string = d.partial_json ?? '';
-                if (block?.kind === 'tool-call') block.acc += argsDelta;
+              const rb = open.get(reasoningIdx) as { kind: 'reasoning'; acc: string };
+              rb.acc += reasoningContent;
+              yield { type: 'reasoning-delta', index: reasoningIdx, text: reasoningContent };
+            }
+
+            // 2. 正文文本增量
+            if (typeof delta?.content === 'string' && delta.content.length > 0) {
+              if (textIdx === undefined) {
+                textIdx = nextBlockIdx++;
+                const tb2: OpenBlock = { kind: 'text', acc: '' };
+                open.set(textIdx, tb2);
+                allBlocks.push(tb2);
+                yield { type: 'block-start', index: textIdx, blockType: 'text' };
+              }
+              const tb2 = open.get(textIdx) as { kind: 'text'; acc: string };
+              tb2.acc += delta.content;
+              yield { type: 'text-delta', index: textIdx, text: delta.content };
+            }
+
+            // 3. 工具调用增量
+            if (Array.isArray(delta?.tool_calls)) {
+              for (const tc of delta.tool_calls) {
+                const tcIndex = tc.index ?? 0;
+                let bIdx = toolBlockOf.get(tcIndex);
+                if (bIdx === undefined) {
+                  bIdx = nextBlockIdx++;
+                  toolBlockOf.set(tcIndex, bIdx);
+                  const tcb: OpenBlock = { kind: 'tool-call', id: '', name: '', acc: '' };
+                  open.set(bIdx, tcb);
+                  allBlocks.push(tcb);
+                  yield { type: 'block-start', index: bIdx, blockType: 'tool-call' };
+                }
+                const tb = open.get(bIdx) as { kind: 'tool-call'; id: string; name: string; acc: string };
+                if (tc.id) tb.id = tc.id;
+                if (tc.function?.name) tb.name = tc.function.name;
+                const argsDelta: string = tc.function?.arguments ?? '';
+                tb.acc += argsDelta;
                 yield {
                   type: 'tool-call-delta',
-                  index,
-                  id: ((block?.kind === 'tool-call' && block.id) || 'call_' + index) as ToolCallId,
-                  ...(block?.kind === 'tool-call' && block.name ? { name: block.name } : {}),
+                  index: bIdx,
+                  id: (tb.id || 'call_' + tcIndex) as ToolCallId,
+                  ...(tb.name ? { name: tb.name } : {}),
                   argumentsDelta: argsDelta,
                 };
               }
-            } else if (currentEvent === 'content_block_stop') {
-              // 上游逐块给出结束信号 —— 这是块结束的权威位置。
-              const index = json.index ?? 0;
-              const block = open.get(index);
-              if (block !== undefined) {
-                open.delete(index);
-                yield* this.closeBlocks(new Map<number, OpenBlock>([[index, block]]));
-              }
-            } else if (currentEvent === 'message_delta') {
-              if (json.usage) {
-                yield {
-                  type: 'usage',
-                  usage: {
-                    inputTokens: json.usage.input_tokens ?? 0,
-                    outputTokens: json.usage.output_tokens ?? 0,
-                    totalTokens: (json.usage.input_tokens ?? 0) + (json.usage.output_tokens ?? 0),
-                  },
-                };
-              }
-              if (json.delta?.stop_reason && !finishEmitted) {
-                finishEmitted = true;
-                yield* this.closeBlocks(open);
-                const sr = json.delta.stop_reason;
-                yield {
-                  type: 'finish',
-                  reason: sr === 'tool_use' ? { kind: 'tool-calls' }
-                    : sr === 'max_tokens' ? { kind: 'max-tokens' }
-                    : { kind: 'stop' },
-                };
-              }
+            }
+
+            // 4. Token 使用量
+            if (json.usage) {
+              yield {
+                type: 'usage',
+                usage: {
+                  inputTokens: json.usage.prompt_tokens ?? 0,
+                  outputTokens: json.usage.completion_tokens ?? 0,
+                  totalTokens: json.usage.total_tokens ?? 0,
+                },
+              };
+            }
+
+            // 5. 结束原因：OpenAI 流里唯一可靠的「块结束」信号。
+            if (choice?.finish_reason && !finishEmitted) {
+              finishEmitted = true;
+              yield* this.closeBlocks(open);
+              const fr = choice.finish_reason;
+              yield {
+                type: 'finish',
+                reason: fr === 'tool_calls' ? { kind: 'tool-calls' }
+                  : fr === 'length' ? { kind: 'max-tokens' }
+                  : { kind: 'stop' },
+                replayState: buildReplayState(fr),
+              };
             }
           } catch {
             // 忽略单行解析失败
           }
         }
       }
+
+      // 流在没有终止事件的情况下结束：仍然把已打开的块收口。
+      yield* this.closeBlocks(open);
+      if (!finishEmitted) {
+        finishEmitted = true;
+        yield { type: 'finish', reason: { kind: 'stop' }, replayState: buildReplayState('stop') };
+      }
+    } catch (err: any) {
+      if (signal?.aborted) {
+        yield* this.closeBlocks(open);
+        yield { type: 'finish', reason: { kind: 'aborted', failure: { code: 'ABORTED', message: 'Request aborted' } } };
+        return;
+      }
+      throw err;
+    } finally {
+      if (signal) {
+        signal.removeEventListener('abort', onAbort);
+      }
+      onAbort();
+    }
+  }
+
+  private async *streamAnthropic(
+    body: import('undici').Dispatcher.ResponseData['body'],
+    signal?: AbortSignal,
+  ): AsyncIterable<StreamChunk> {
+    const onAbort = () => {
+      try {
+        body.destroy();
+      } catch {}
+    };
+    if (signal) {
+      if (signal.aborted) {
+        onAbort();
+        yield { type: 'finish', reason: { kind: 'aborted', failure: { code: 'ABORTED', message: 'Request aborted' } } };
+        return;
+      }
+      signal.addEventListener('abort', onAbort, { once: true });
     }
 
-    yield* this.closeBlocks(open);
-    if (!finishEmitted) yield { type: 'finish', reason: { kind: 'stop' } };
+    let buffer = '';
+    let currentEvent = '';
+    let nextBlockIdx = 0;
+    let finishEmitted = false;
+    const open = new Map<number, OpenBlock>();
+    const allBlocks: OpenBlock[] = [];
+
+    const buildReplayState = (stopReason: string): ReplayEnvelope => ({
+      response: { stop_reason: stopReason },
+      blocks: allBlocks.map((b) => {
+        if (b.kind === 'reasoning') return { type: 'thinking', signature: b.signature };
+        if (b.kind === 'tool-call') return { type: 'tool-call', id: b.id, name: b.name };
+        return { type: 'text' };
+      }),
+    });
+
+    try {
+      for await (const chunk of body) {
+        if (signal?.aborted) {
+          yield* this.closeBlocks(open);
+          yield { type: 'finish', reason: { kind: 'aborted', failure: { code: 'ABORTED', message: 'Request aborted' } } };
+          return;
+        }
+
+        buffer += (chunk as Buffer).toString('utf8');
+        const lines = buffer.split('\n');
+        buffer = lines.pop() ?? '';
+
+        for (const rawLine of lines) {
+          const line = rawLine.trim();
+          if (line.startsWith('event: ')) {
+            currentEvent = line.slice(7).trim();
+          } else if (line.startsWith('data: ')) {
+            const dataStr = line.slice(6).trim();
+            try {
+              const json = JSON.parse(dataStr);
+
+              if (currentEvent === 'content_block_start') {
+                const b = json.content_block;
+                const index = json.index ?? nextBlockIdx;
+                if (b?.type === 'text') {
+                  const tb: OpenBlock = { kind: 'text', acc: '' };
+                  open.set(index, tb);
+                  allBlocks.push(tb);
+                  yield { type: 'block-start', index, blockType: 'text' };
+                } else if (b?.type === 'thinking') {
+                  const rb: OpenBlock = { kind: 'reasoning', acc: '', signature: b.signature ?? '' };
+                  open.set(index, rb);
+                  allBlocks.push(rb);
+                  yield { type: 'block-start', index, blockType: 'reasoning' };
+                } else if (b?.type === 'tool_use') {
+                  const tcb: OpenBlock = { kind: 'tool-call', id: b.id ?? '', name: b.name ?? '', acc: '' };
+                  open.set(index, tcb);
+                  allBlocks.push(tcb);
+                  yield { type: 'block-start', index, blockType: 'tool-call' };
+                }
+                nextBlockIdx = Math.max(nextBlockIdx, index + 1);
+              } else if (currentEvent === 'content_block_delta') {
+                const d = json.delta;
+                const index = json.index ?? 0;
+                const block = open.get(index);
+                if (d?.type === 'text_delta') {
+                  if (block?.kind === 'text') block.acc += d.text ?? '';
+                  yield { type: 'text-delta', index, text: d.text ?? '' };
+                } else if (d?.type === 'thinking_delta') {
+                  if (block?.kind === 'reasoning') block.acc += d.thinking ?? '';
+                  yield { type: 'reasoning-delta', index, text: d.thinking ?? '' };
+                } else if (d?.type === 'signature_delta') {
+                  if (block?.kind === 'reasoning') {
+                    block.signature = (block.signature ?? '') + (d.signature ?? '');
+                  }
+                } else if (d?.type === 'input_json_delta') {
+                  const argsDelta: string = d.partial_json ?? '';
+                  if (block?.kind === 'tool-call') block.acc += argsDelta;
+                  yield {
+                    type: 'tool-call-delta',
+                    index,
+                    id: ((block?.kind === 'tool-call' && block.id) || 'call_' + index) as ToolCallId,
+                    ...(block?.kind === 'tool-call' && block.name ? { name: block.name } : {}),
+                    argumentsDelta: argsDelta,
+                  };
+                }
+              } else if (currentEvent === 'content_block_stop') {
+                // 上游逐块给出结束信号 —— 这是块结束的权威位置。
+                const index = json.index ?? 0;
+                const block = open.get(index);
+                if (block !== undefined) {
+                  open.delete(index);
+                  yield* this.closeBlocks(new Map<number, OpenBlock>([[index, block]]));
+                }
+              } else if (currentEvent === 'message_delta') {
+                if (json.usage) {
+                  yield {
+                    type: 'usage',
+                    usage: {
+                      inputTokens: json.usage.input_tokens ?? 0,
+                      outputTokens: json.usage.output_tokens ?? 0,
+                      totalTokens: (json.usage.input_tokens ?? 0) + (json.usage.output_tokens ?? 0),
+                    },
+                  };
+                }
+                if (json.delta?.stop_reason && !finishEmitted) {
+                  finishEmitted = true;
+                  yield* this.closeBlocks(open);
+                  const sr = json.delta.stop_reason;
+                  yield {
+                    type: 'finish',
+                    reason: sr === 'tool_use' ? { kind: 'tool-calls' }
+                      : sr === 'max_tokens' ? { kind: 'max-tokens' }
+                      : { kind: 'stop' },
+                    replayState: buildReplayState(sr),
+                  };
+                }
+              }
+            } catch {
+              // 忽略单行解析失败
+            }
+          }
+        }
+      }
+
+      yield* this.closeBlocks(open);
+      if (!finishEmitted) {
+        finishEmitted = true;
+        yield { type: 'finish', reason: { kind: 'stop' }, replayState: buildReplayState('stop') };
+      }
+    } catch (err: any) {
+      if (signal?.aborted) {
+        yield* this.closeBlocks(open);
+        yield { type: 'finish', reason: { kind: 'aborted', failure: { code: 'ABORTED', message: 'Request aborted' } } };
+        return;
+      }
+      throw err;
+    } finally {
+      if (signal) {
+        signal.removeEventListener('abort', onAbort);
+      }
+      onAbort();
+    }
   }
 }

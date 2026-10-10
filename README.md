@@ -123,7 +123,7 @@ POST /plugins/agentrouter/test
 node test/plugin.test.mjs     # 或 pnpm test
 ```
 
-36 项，全部离线（对本地 stub 中转站），覆盖：未鉴权即时拦截、无效代理拦截、零本地回环端口验证、两种协议的出站线格式、`strict` 工具保护、静默重试的四种判定、OpenAI 与 Anthropic SSE 双协议流式增量解析、代理 scheme 校验、volatile 解包、模型目录同步的幂等性、协议择优、原生适配器契约与动态配置、以及「唯一的 HTTP 接口」这一约束。
+42 项，全部离线（对本地 stub 中转站），覆盖：未鉴权即时拦截、无效代理拦截、零本地回环端口验证、取消生成即时中止上游连接防盗刷、Anthropic 思考真签名捕获与回放（无假签名安全降级）、两种协议的出站线格式、`strict` 工具保护、静默重试的四种判定与外层防放大、OpenAI 与 Anthropic SSE 双协议流式增量解析、自适应 thinking budget 约束、代理 scheme 校验、volatile 解包、模型目录同步的幂等性、协议择优、原生适配器契约与动态配置、以及「唯一的 HTTP 接口」这一约束。
 
 > 若 `node --test` 因沙箱禁止子进程而报 `spawn EPERM`，直接 `node test/plugin.test.mjs` 即可。
 
@@ -137,7 +137,7 @@ src/config.ts       配置解析与持久化、模型目录同步、旧密钥迁
 src/catalog.ts      种子模型表、协议择优、覆盖套用
 src/net.ts          undici 传输、代理校验、连通性探测、UA 指纹
 src/schema.ts       出站工具 schema 清洗（两种协议形状、严格模式保护）
-src/adapter.ts      原生 AgentRouterLlmAdapter（内存直连、双协议流式、方言重发）
+src/adapter.ts      原生 AgentRouterLlmAdapter（内存直连、双协议流式、方言重发、真签名回放、即时中止）
 src/client/index.ts 浏览器半边：原生设置卡片
-test/               行为测试（36 项，全离线）
+test/               行为测试（42 项，全离线）
 ```

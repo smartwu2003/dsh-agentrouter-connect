@@ -465,6 +465,140 @@ test('every opened block is closed with a block-end carrying the assembled conte
   assert.ok(anthropic.some(c => c.type === 'finish' && c.reason.kind === 'tool-calls'));
 });
 
+test('aborting the signal terminates stream with finish aborted and stops consuming', async () => {
+  useHome();
+  const mod = await host();
+  const adapter = createAdapter(mod, { protocolPreference: 'openai-first' });
+  const controller = new AbortController();
+
+  script = [{ raw: 'data: {"choices":[{"delta":{"content":"start"}}]}\n\n' }];
+
+  // Abort immediately
+  controller.abort();
+  const chunks = await collectStream(adapter.stream({
+    model: 'gpt-6-astra',
+    messages: [{ role: 'user', content: 'hi' }],
+    signal: controller.signal,
+  }));
+  assert.ok(chunks.some(c => c.type === 'finish' && c.reason.kind === 'aborted'));
+});
+
+test('Anthropic stream captures signature_delta and exports it via replayState on finish', async () => {
+  useHome();
+  const mod = await host();
+  const adapter = createAdapter(mod, { protocolPreference: 'anthropic-first' });
+
+  script = [{ raw: [
+    'event: content_block_start\ndata: {"index":0,"content_block":{"type":"thinking"}}\n\n',
+    'event: content_block_delta\ndata: {"index":0,"delta":{"type":"thinking_delta","thinking":"thinking deep"}}\n\n',
+    'event: content_block_delta\ndata: {"index":0,"delta":{"type":"signature_delta","signature":"real_sig_12345"}}\n\n',
+    'event: content_block_stop\ndata: {"index":0}\n\n',
+    'event: content_block_start\ndata: {"index":1,"content_block":{"type":"text"}}\n\n',
+    'event: content_block_delta\ndata: {"index":1,"delta":{"type":"text_delta","text":"done"}}\n\n',
+    'event: content_block_stop\ndata: {"index":1}\n\n',
+    'event: message_delta\ndata: {"delta":{"stop_reason":"end_turn"},"usage":{"input_tokens":10,"output_tokens":10}}\n\n',
+  ].join('') }];
+
+  const chunks = await collectStream(adapter.stream({ model: 'deepseek-v4-flash', messages: [{ role: 'user', content: 'hi' }] }));
+  const finish = chunks.find(c => c.type === 'finish');
+  assert.ok(finish?.replayState);
+  assert.equal(finish.replayState.response.stop_reason, 'end_turn');
+  const thinkingBlock = finish.replayState.blocks.find(b => b.type === 'thinking');
+  assert.equal(thinkingBlock.signature, 'real_sig_12345');
+});
+
+test('replaying an assistant message uses real captured signature, and safely degrades to text without fake signature', async () => {
+  useHome();
+  const mod = await host();
+  const adapter = createAdapter(mod, { protocolPreference: 'anthropic-first' });
+
+  // 1. With captured signature in replayState -> outputs thinking block with real signature
+  await collectStream(adapter.stream({
+    model: 'deepseek-v4-flash',
+    messages: [
+      { role: 'user', content: 'hi' },
+      {
+        role: 'assistant',
+        content: [{ type: 'reasoning', text: 'my reasoning' }, { type: 'text', text: 'answer' }],
+        source: {
+          kind: 'model',
+          provider: 'agentrouter',
+          model: 'deepseek-v4-flash',
+          replayState: {
+            response: { stop_reason: 'end_turn' },
+            blocks: [{ type: 'thinking', signature: 'real_sig_12345' }, { type: 'text' }],
+          },
+        },
+      },
+      { role: 'user', content: 'next' },
+    ],
+  }));
+
+  const upstream1 = JSON.parse(seen.at(-1).body);
+  const assistantMsg1 = upstream1.messages.find(m => m.role === 'assistant');
+  const thinkingBlock1 = assistantMsg1.content.find(b => b.type === 'thinking');
+  assert.ok(thinkingBlock1);
+  assert.equal(thinkingBlock1.signature, 'real_sig_12345');
+
+  // 2. Without captured signature -> safely degrades to text block, NEVER emits literal 'signature'
+  await collectStream(adapter.stream({
+    model: 'deepseek-v4-flash',
+    messages: [
+      { role: 'user', content: 'hi' },
+      {
+        role: 'assistant',
+        content: [{ type: 'reasoning', text: 'unverified reasoning' }, { type: 'text', text: 'answer' }],
+      },
+      { role: 'user', content: 'next' },
+    ],
+  }));
+
+  const upstream2 = JSON.parse(seen.at(-1).body);
+  const assistantMsg2 = upstream2.messages.find(m => m.role === 'assistant');
+  const thinkingBlock2 = assistantMsg2.content.find(b => b.type === 'thinking');
+  assert.equal(thinkingBlock2, undefined, 'unverified reasoning must not emit a thinking block with fake signature');
+  const textBlocks = assistantMsg2.content.filter(b => b.type === 'text');
+  assert.ok(textBlocks.some(b => b.text === 'unverified reasoning'));
+});
+
+test('providerRetryPolicy returns maxRetries: 0 to prevent double retry amplification', async () => {
+  useHome();
+  const mod = await host();
+  const adapter = createAdapter(mod);
+  const policy = adapter.providerRetryPolicy(mod.AGENTROUTER_PROVIDER);
+  assert.equal(policy.maxRetries, 0, 'harness retries must be disabled to avoid multiplying with adapter internal retries');
+});
+
+test('Anthropic thinking budget adapts to reasoningEffort and satisfies budget < max_tokens', async () => {
+  useHome();
+  const mod = await host();
+  const adapter = createAdapter(mod, { protocolPreference: 'anthropic-first' });
+
+  // Low effort
+  await collectStream(adapter.stream({
+    model: 'deepseek-v4-flash',
+    reasoningEffort: 'low',
+    maxTokens: 4096,
+    messages: [{ role: 'user', content: 'hi' }],
+  }));
+  const bodyLow = JSON.parse(seen.at(-1).body);
+  assert.ok(bodyLow.thinking?.budget_tokens);
+  assert.ok(bodyLow.thinking.budget_tokens < bodyLow.max_tokens);
+  assert.ok(bodyLow.thinking.budget_tokens <= 2048);
+
+  // High effort
+  await collectStream(adapter.stream({
+    model: 'deepseek-v4-flash',
+    reasoningEffort: 'high',
+    maxTokens: 32000,
+    messages: [{ role: 'user', content: 'hi' }],
+  }));
+  const bodyHigh = JSON.parse(seen.at(-1).body);
+  assert.ok(bodyHigh.thinking?.budget_tokens);
+  assert.ok(bodyHigh.thinking.budget_tokens < bodyHigh.max_tokens);
+  assert.ok(bodyHigh.thinking.budget_tokens > 2048);
+});
+
 test('an unsupported proxy scheme is refused with an actionable message', async () => {
   const mod = await host();
   for (const bad of ['socks5://127.0.0.1:1080', 'socks://127.0.0.1:1080', 'not a url', 'ftp://x']) {

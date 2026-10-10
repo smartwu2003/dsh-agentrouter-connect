@@ -3,6 +3,8 @@ node_modules/
 
 # local probe / scratch scripts (contain machine-specific paths)
 scratch/
+tools/
+
 
 # internal handover doc (not for public)
 HANDOVER.md
