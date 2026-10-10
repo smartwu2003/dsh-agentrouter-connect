@@ -1,0 +1,6 @@
+# 本插件为独立包（自带 node_modules，经 junction 部署到 DSH profiles）。
+# 下面两项是 pnpm 生成的构建脚本审批占位符，插件运行不需要它们，
+# 显式设为 false 以避免每次安装都被交互式询问。
+allowBuilds:
+  '@google/genai': false
+  protobufjs: false

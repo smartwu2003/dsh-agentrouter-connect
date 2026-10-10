@@ -1,0 +1,12 @@
+# dependencies
+node_modules/
+
+# local probe / scratch scripts (contain machine-specific paths)
+scratch/
+
+# internal handover doc (not for public)
+HANDOVER.md
+
+# build cache / logs
+*.log
+.DS_Store

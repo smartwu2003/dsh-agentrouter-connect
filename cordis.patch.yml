@@ -1,0 +1,4 @@
+# Register the AgentRouter provider without manual provider model tables.
+- insert:
+    - id: llm-agentrouter
+      name: dsh-agentrouter-connect
