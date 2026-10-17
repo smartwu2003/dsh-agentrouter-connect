@@ -47,6 +47,21 @@ npx tsdown        # 产出 lib/index.js（Host）与 lib/client.js（Web 模块�
 > 插件经 junction 部署到 `~/.dsh/profiles/<profile>/node_modules/dsh-agentrouter-connect`，
 > 重新构建后需**完全重启 DSH** 才会加载新的 `lib/`。
 
+### 版本要求
+
+`peerDependencies` 用的是**区间**而不是钉死的版本号：
+
+| 依赖 | 区间 |
+|---|---|
+| `@deepseek-ai/dsh-llm` | `>=0.2.0-rc.2 <0.3.0-0` |
+| `@deepseek-ai/dsh-llm-pi-ai` | `>=0.2.0-rc.2 <0.3.0-0` |
+| `@earendil-works/pi-ai` | `>=0.87.1 <2.0.0` |
+
+DSH 在启动时会用 `engines.dsh`（若声明）或这些 peer 区间去校验插件与运行时的兼容性。
+写成 `"0.2.0-rc.2"` 这种**精确版本**会让插件在 DSH 升到 `0.2.1-rc.2` 时被判定为
+「与当前 dsh 不兼容」并在启动时禁用 —— 这正是 0.1.0 版遇到的问题。改用区间后，
+同一份构建可以在整个 `0.2.x` 系列里运行。`engines.node` 只约束 Node 版本，不参与这项判定。
+
 ---
 
 ## ⚙️ 配置
